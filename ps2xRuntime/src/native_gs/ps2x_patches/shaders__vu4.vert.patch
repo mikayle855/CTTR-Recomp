@@ -1,0 +1,11 @@
+--- a/shaders/vu4.vert
++++ b/shaders/vu4.vert
+@@ -22,7 +22,7 @@
+ } u;
+ void main() {
+     vec4 s = u.screen * inPos;
+-    gl_Position = vec4((s.x - u.misc.x * s.w) / 512.0 - s.w, s.w - (s.y - u.misc.y * s.w) / 512.0, s.z / u.misc.z, s.w);
++    gl_Position = vec4((s.x - u.misc.x * s.w) / GS_HALF_W - s.w, s.w - (s.y - u.misc.y * s.w) / GS_HALF_H, s.z / u.misc.z, s.w);
+     vColor = clamp(floor(inColor), 0.0, 255.0) / 255.0;
+     vStq = vec3(inSt.xy, 1.0);
+ }

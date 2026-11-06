@@ -1,0 +1,11 @@
+--- a/shaders/gs.vert
++++ b/shaders/gs.vert
+@@ -7,7 +7,7 @@
+ layout(location = 0) out vec4 vColor;
+ layout(location = 1) out vec3 vStq;
+ void main() {
+-    gl_Position = vec4(inPos.x / 512.0 - 1.0, 1.0 - inPos.y / 512.0, inPos.z, 1.0); // SDL GPU: +Y is up in clip space
++    gl_Position = vec4(inPos.x / GS_HALF_W - 1.0, 1.0 - inPos.y / GS_HALF_H, inPos.z, 1.0); // SDL GPU: +Y is up in clip space
+     vColor = inColor;
+     vStq = inStq;
+ }

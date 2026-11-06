@@ -1,0 +1,11 @@
+--- a/shaders/vu6.vert
++++ b/shaders/vu6.vert
+@@ -25,7 +25,7 @@
+     vec4 p = vec4(inPos.xyz, 1.0);
+     vec4 s = u.screen * p;
+     vec2 st = ((u.shadowCam * p).xy * u.scale.x + 1.0) * 0.5;
+-    gl_Position = vec4((s.x - u.misc.x * s.w) / 512.0 - s.w, s.w - (s.y - u.misc.y * s.w) / 512.0, s.z / u.misc.z, s.w);
++    gl_Position = vec4((s.x - u.misc.x * s.w) / GS_HALF_W - s.w, s.w - (s.y - u.misc.y * s.w) / GS_HALF_H, s.z / u.misc.z, s.w);
+     vColor = clamp(floor(inColor), 0.0, 255.0) / 255.0;
+     vStq = vec3(st * u.texScale.xy, 1.0);
+ }

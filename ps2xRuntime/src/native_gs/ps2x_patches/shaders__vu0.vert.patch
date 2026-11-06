@@ -1,0 +1,11 @@
+--- a/shaders/vu0.vert
++++ b/shaders/vu0.vert
+@@ -30,7 +30,7 @@
+     // Programs 2a / 2b: the shadow camera's matrix is orthographic with a NEGATIVE constant w (measured: -862).
+     // The PS2 only divides by it; a GPU would clip everything as "behind the eye". The same point with w > 0:
+     if (u.misc.w == 2.0 && s.w < 0.0) s = -s;
+-    gl_Position = vec4((s.x - u.misc.x * s.w) / 512.0 - s.w, s.w - (s.y - u.misc.y * s.w) / 512.0, s.z / u.misc.z, s.w);
++    gl_Position = vec4((s.x - u.misc.x * s.w) / GS_HALF_W - s.w, s.w - (s.y - u.misc.y * s.w) / GS_HALF_H, s.z / u.misc.z, s.w);
+     if (u.misc.w == 2.0) {
+         // programs 2a / 2b (flat-colour model for the shadow): their "screen" matrix is the shadow camera's, whose
+         // depth is not kept inside the depth range; the PS2 just stores whatever integer comes out. Keep every

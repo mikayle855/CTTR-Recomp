@@ -1,0 +1,461 @@
+--- /dev/fd/63	2026-10-11 04:59:53.000000000 -0700
++++ /dev/fd/62	2026-10-11 04:59:53.000000000 -0700
+@@ -47,6 +47,7 @@
+ 
+ static GsBackend *sBackend;
+ static int sSmooth2d = 1; /* the setting "2D filtering" (smooth_2d; BT3_2D_SMOOTH=0/1 wins): 1 smooth */
++int gBt3PageTraceAt = -2; /* [ps2x] the BT3_PAGE_TRACE frame, shared with the upload trace in gs_core.c */
+ static int sWholeFrame; /* the draw being set up shows a frame the game read back (the cross-fade) */
+ 
+ /* The one window both back ends share: shape (aspect), full screen and display are the renderer's, not a
+@@ -67,6 +68,7 @@
+ static int sDisplaySetting;
+ 
+ int gsScale = 2;
++int gsTargetW = 640, gsTargetH = 512; /* [ps2x] see gs_draw.h */
+ int gsPendingScale;
+ GsTex gsWhite;
+ GsDraw *gsDraws;
+@@ -108,8 +110,22 @@
+     int replaced;  /* from a texture pack: several times the size, so always filtered (texture_get) */
+     uint32_t ow, oh, rw, rh; /* then: the original's size and the replacement's */
+     uint32_t amax;           /* and the largest alpha byte of the original */
++    uint64_t bytes;          /* [ps2x] video memory it takes */
++    char pend[48];           /* [ps2x] a pack replacement being decoded off the render thread (its token), or "" */
++    uint32_t pendAmax;       /* and the original's largest alpha byte for it */
++    unsigned pendSince;      /* frame it was asked for (given up after 600) */
+ } Tex;
++int TexPack_LoadAsync(const char *path, TexPackImage *img); /* [ps2x] native_gs_glue.cpp */
+ static Tex sTex[MAX_TEX];
++/* [ps2x] the cache's video memory and its budget (BT3_TEX_BUDGET_MB, default 384): over it, the textures not used for
++   two seconds go, as when the cache is full by count (a 4 GB card ran out at 6x: targets + 8192 cached textures) */
++static uint64_t sTexBytes;
++static uint64_t tex_budget(void) {
++    static uint64_t b;
++    if (b == 0) { b = (uint64_t)(getenv("BT3_TEX_BUDGET_MB") != NULL ? atoi(getenv("BT3_TEX_BUDGET_MB")) : 384) << 20; }
++    return b;
++}
++uint64_t NativeGs_TexBytes(void) { return sTexBytes; }
+ static uint16_t sTexBucket[TEX_BUCKETS]; /* index + 1 of a cache entry, 0 = empty (open addressing) */
+ static Tex *sLast; /* the entry the previous lookup returned */
+ 
+@@ -145,6 +161,41 @@
+ 
+ /* GS memory -> an RGBA texture for the current TEX0 (alpha as stored: 0x80 is opaque). The back end makes
+    the texture and takes the decoded pixels (freed after it has uploaded them). */
++/* [ps2x] A replacement asked for when this texture was first seen: swapped in once ps2tex's workers have decoded it
++   (the original is shown until then, a few frames). */
++static void tex_pack_poll(Tex *c) {
++    TexPackImage pack;
++    int level, f;
++    GsTex nt;
++    if (TexPack_LoadAsync(c->pend, &pack) != 1) {
++        if (gGsFrame - c->pendSince > 600) { c->pend[0] = 0; }
++        return;
++    }
++    c->pend[0] = 0;
++    f = pack.format & 3;
++    if (sBackend->texSlotsLeft() < pack.levels || (nt = sBackend->texCreate(pack.w, pack.h, f, pack.levels)) == 0) {
++        TexPack_Free(&pack);
++        return;
++    }
++    for (level = 0; level < pack.levels; level++) {
++        uint32_t lw = pack.w >> level ? pack.w >> level : 1, lh = pack.h >> level ? pack.h >> level : 1;
++        void *buf = malloc(pack.bytes[level]);
++        memcpy(buf, pack.data[level], pack.bytes[level]);
++        sBackend->texUpload(nt, level, lw, lh, f, buf, pack.bytes[level]);
++    }
++    sBackend->texDestroy(c->tex);
++    sTexBytes -= c->bytes;
++    c->tex = nt;
++    c->replaced = 1;
++    c->rw = pack.w;
++    c->rh = pack.h;
++    c->amax = c->pendAmax;
++    c->bytes = (uint64_t)pack.w * pack.h * (f == GS_TEXFMT_RGBA8 ? 4u : 1u) * 4u / 3u;
++    sTexBytes += c->bytes;
++    gGpuTexReplaced++;
++    TexPack_Free(&pack);
++}
++
+ static GsTex texture_get(int ctx) {
+     uint64_t t0 = gGs.tex0[ctx] & 0x1FFFFFFFFFFFFFFFull, texa = gGs.texa;
+     uint32_t tbp = t0 & 0x3FFF, tbw = (t0 >> 14) & 0x3F, psm = (t0 >> 20) & 0x3F, tw = 1u << ((t0 >> 26) & 15), th = 1u << ((t0 >> 30) & 15);
+@@ -155,6 +206,8 @@
+     TexPackImage pack;
+     uint32_t packMaxAlpha = 255, rw = tw, rh = th;
+     int packFormat = GS_TEXFMT_RGBA8, replaced = 0;
++    const char *pendTok = NULL; /* [ps2x] */
++    static int packSync = -1;
+ 
+     if (tw > 1024) { tw = 1024; }
+     if (th > 1024) { th = 1024; }
+@@ -171,6 +224,7 @@
+     }
+     if (sLast != NULL && sLast->tex0 == t0 && sLast->texa == texa && sLast->gen == gen) {
+         sLast->last = gGsFrame;
++        if (sLast->pend[0]) { tex_pack_poll(sLast); }
+         return sLast->tex; /* the common case: the same texture as the previous primitive */
+     }
+     {
+@@ -180,6 +234,7 @@
+             if (c->tex0 == t0 && c->texa == texa && c->gen == gen) {
+                 c->last = gGsFrame;
+                 sLast = c;
++                if (c->pend[0]) { tex_pack_poll(c); }
+                 return c->tex;
+             }
+             h = (h + 1) & (TEX_BUCKETS - 1);
+@@ -188,16 +243,17 @@
+     if (sBackend->texSlotsLeft() <= 0) {
+         return gsWhite;
+     }
+-    if (gsTexCount == MAX_TEX) {
++    if (gsTexCount == MAX_TEX || sTexBytes > tex_budget()) {
+         /* full: drop everything not used for two seconds (or, failing that, not used this frame) in one sweep */
+         unsigned keep = gGsFrame > 120 ? gGsFrame - 120 : 0;
+         int pass, n;
+-        for (pass = 0; pass < 2 && gsTexCount == MAX_TEX; pass++, keep = gGsFrame) {
++        for (pass = 0; pass < 2 && (pass == 0 || gsTexCount == MAX_TEX); pass++, keep = gGsFrame) {
+             for (n = 0, i = 0; i < (uint32_t)gsTexCount; i++) {
+                 if (sTex[i].last >= keep) {
+                     sTex[n++] = sTex[i];
+                 } else {
+                     sBackend->texDestroy(sTex[i].tex);
++                    sTexBytes -= sTex[i].bytes;
+                 }
+             }
+             gsTexCount = n;
+@@ -219,7 +275,12 @@
+     /* a texture pack's replacement for this texture, if there is one (gs_texpack.c) */
+     if (sTexPackOn && TexPack_Count() != 0) {
+         const char *path = TexPack_Lookup(tbp, tbw, psm, tw, th, (uint32_t)((t0 >> 34) & 1), cbp, cpsm, &packMaxAlpha);
+-        if (path != NULL && TexPack_Load(path, &pack)) {
++        if (packSync < 0) { packSync = getenv("BT3_PACK_SYNC") != NULL; } /* [ps2x] the old way: decoded here */
++        if (path != NULL && !packSync && TexPack_LoadAsync(path, &pack) != 1) {
++            pendTok = path; /* [ps2x] not decoded yet: the original now, the replacement when it is ready */
++            path = NULL;
++        }
++        if (path != NULL && (packSync ? TexPack_Load(path, &pack) : 1)) {
+             packFormat = pack.format & 3;
+             if (sBackend->texSlotsLeft() >= pack.levels) {
+                 replaced = 1;
+@@ -268,18 +329,19 @@
+         }
+         TexPack_Free(&pack);
+     } else {
+-        sBackend->texUpload(t->tex, 0, tw, th, GS_TEXFMT_RGBA8, px, tw * th * 4);
+         if (getenv("BT3_TEX_DUMP") != NULL) { /* every texture as it is decoded, raw RGBA with a small header (looking at the game's art) */
+             static unsigned n;
+             char name[600];
+             FILE *df;
+-            snprintf(name, sizeof(name), "%s/tex_%05u_f%06u_%ux%u.rgba", getenv("BT3_TEX_DUMP"), n++, gGsFrame, (unsigned)tw, (unsigned)th);
++            snprintf(name, sizeof(name), "%s/tex_%05u_f%06u_%ux%u_tbp%04x_tbw%u_psm%02x_cbp%04x_cpsm%u_csm%u_csa%u.rgba", getenv("BT3_TEX_DUMP"), n++, gGsFrame,
++                     (unsigned)tw, (unsigned)th, tbp, tbw, psm, cbp, cpsm, (unsigned)((t0 >> 55) & 1), (unsigned)((t0 >> 56) & 31)); /* [ps2x] TEX0 in the name */
+             df = fopen(name, "wb");
+             if (df != NULL) {
+                 fwrite(px, 1, (size_t)tw * th * 4, df);
+                 fclose(df);
+             }
+         }
++        sBackend->texUpload(t->tex, 0, tw, th, GS_TEXFMT_RGBA8, px, tw * th * 4); /* [ps2x] after the dump: it takes px */
+     }
+     gsTexCount++;
+     {
+@@ -302,6 +364,15 @@
+     t->rw = rw;
+     t->rh = rh;
+     t->amax = replaced ? packMaxAlpha : 255u;
++    t->pend[0] = 0;
++    if (pendTok != NULL && strlen(pendTok) < sizeof(t->pend)) { /* [ps2x] */
++        strcpy(t->pend, pendTok);
++        t->pendAmax = packMaxAlpha;
++        t->pendSince = gGsFrame;
++    }
++    /* [ps2x] its video memory: RGBA8, or a pack's compressed levels (a third more for the smaller copies) */
++    t->bytes = replaced ? (uint64_t)rw * rh * (packFormat == GS_TEXFMT_RGBA8 ? 4u : 1u) * 4u / 3u : (uint64_t)tw * th * 4u;
++    sTexBytes += t->bytes;
+     return t->tex;
+ }
+ 
+@@ -445,7 +516,11 @@
+     d.src = gsDepthByteIsFog ? 0 : 1;
+     d.target = GsDraw_TargetGet((uint32_t)(gGs.frame[ctx] & 0x1FF), 0);
+     /* switched off by the user: the passes that colour the picture (the ones that only write alpha feed the glow) */
+-    if (d.target < 0 || ((gsFxOff & 4) && d.src == 0 && wm != 0x00FFFFFFu)) {
++    /* [ps2x] BT4: the fog value made from depth (src 0) is BT3's formula, and BT4's data turns it into alphas up to
++       0xE3 where the console has next to none; a later pass mixes the work buffer at 0x150 in by that alpha (at up
++       to 1.77x) while 0x150 holds a shadow or the stage textures streamed through it: black far scenery in fights,
++       white noise in the intros. With the depth tint off, its alpha-only pass is dropped as well. */
++    if (d.target < 0 || ((gsFxOff & 4) && d.src == 0)) {
+         return;
+     }
+     {
+@@ -474,6 +549,17 @@
+     gsDraws[gsDrawCount++] = d;
+ }
+ 
++/* [ps2x] Whether a buffer is one of the game's screen buffers: the one shown now or one shown before (BT4 draws the
++   next frame into the other buffer while gGsMainFbp still names the shown one). Those are never "stale": that mark
++   is for work buffers that missed a pass. Marking a screen buffer stale dropped the distance blur's copy of the
++   frame into the work buffer 0x150, and its paste-back then showed the fighters' shadow silhouette drawn there
++   (white or grey ghost figures at twice their size, about one picture in four in a fight). */
++static int screen_buffer(uint32_t fbp) {
++    static unsigned char was[512];
++    if (gGsMainFbp >= 0) { was[gGsMainFbp & 511] = 1; }
++    return was[fbp & 511];
++}
++
+ static int draw_state(int ctx, int topo, int sprite, int vu, GsDraw *d, float *us, float *vs) {
+     uint64_t prim = gGs.prim, t0 = gGs.tex0[ctx], test = gGs.test[ctx], cl = gGs.clamp[ctx], sc = gGs.scissor[ctx];
+     int tme = (prim >> 4) & 1, src;
+@@ -504,7 +590,7 @@
+             }
+         }
+         if (Gs_PsmBits(fpsm) == 16 || fbp == zbp) {
+-            if (fbp != zbp && fbp != (uint32_t)gGsMainFbp) {
++            if (fbp != zbp && !screen_buffer(fbp)) {
+                 /* A work buffer drawn through a 16-bit view (the outline's edge image): not drawable here, but
+                    the game has now written the buffer, so whatever samples it next means this buffer and not the
+                    stage textures that share its address. Without this the outline's later passes read those
+@@ -531,7 +617,7 @@
+         if (tme && !(tpsm == 1 && sprite && tbp / 32 == zbp) &&
+             ((tpsm & 0x30) == 0x30 || tbp / 32 == zbp || tpsm == 0x1B || tpsm == 0x24 || tpsm == 0x2C)) {
+             int t = GsDraw_TargetGet(fbp, 0);
+-            if (t >= 0 && fbp != (uint32_t)gGsMainFbp) {
++            if (t >= 0 && !screen_buffer(fbp)) {
+                 gsTargets[t].stale = 1; /* a work buffer missed a pass */
+             }
+             gsSkipped++;
+@@ -539,14 +625,22 @@
+         }
+     }
+     memset(d, 0, sizeof(*d));
++    d->t0 = tme ? t0 : 0; /* [ps2x] */
+     d->target = GsDraw_TargetGet((uint32_t)(gGs.frame[ctx] & 0x1FF), 1);
+     if (d->target < 0) {
+         return 0;
+     }
++    /* [ps2x] drawn into now: newer than any upload over its pages so far (BT4 streams stage textures through the
++       memory of a work buffer every frame; the buffer, redrawn later in the frame, must then be read as itself) */
++    gsTargets[d->target].gen = gGsPageGen[gsTargets[d->target].fbp & 511];
+     d->tex = gsWhite;
+     if (!tme && sprite) {
+         gsTargets[d->target].stale = 0; /* cleared by the game: what is drawn into it from here on is real */
+     }
++    if (!tme && (uint32_t)(gGs.frame[ctx] & 0x1FF) == 0x150 && getenv("BT3_150LOG") != NULL) { /* [ps2x] (see [150] below) */
++        fprintf(stderr, "[150] f %u vu %d spr %d tme 0 fbw %u fmsk %08x rgba %08x scis %08llx\n", gGsFrame, vu, sprite,
++                (unsigned)((gGs.frame[ctx] >> 16) & 0x3F), (unsigned)(gGs.frame[ctx] >> 32), (unsigned)gGs.rgbaq, (unsigned long long)gGs.scissor[ctx]);
++    }
+     if (tme) {
+         int kept = 0;
+         src = GsDraw_TargetGet((uint32_t)((t0 & 0x3FFF) / 32), 0);
+@@ -557,12 +651,80 @@
+                 kept = 1;
+             }
+         }
++        {   /* [ps2x] BT3_TEXSRC_LOG=<frame>: textured draws near a render target that frame, and why they do or do not
++               sample it (once per texture address / format / reason) */
++            static int at = -2;
++            if (at == -2) { at = getenv("BT3_TEXSRC_LOG") != NULL ? atoi(getenv("BT3_TEXSRC_LOG")) : -1; }
++            if (at >= 0 && (int)gGsFrame == at) {
++                static uint64_t seen[256];
++                static int nseen;
++                uint32_t page = (uint32_t)((t0 & 0x3FFF) / 32), tpsm = (uint32_t)((t0 >> 20) & 0x3F), near = 0xFFFFFFFFu;
++                int k, why = src < 0 ? 0 : (t0 & 0x1F) != 0 ? 1 : !gsTargets[src].cleared ? 2 :
++                             gsTargets[src].gen != gGsPageGen[gsTargets[src].fbp & 511] ? 3 : gsTargets[src].stale ? 4 : 5;
++                uint64_t key = (uint64_t)(t0 & 0x3FFF) | (uint64_t)tpsm << 16 | (uint64_t)why << 24;
++                for (k = 0; k < gsTargetCount; k++) {
++                    uint32_t f = gsTargets[k].fbp, dist = page > f ? page - f : f - page;
++                    if (dist < near) { near = dist; }
++                }
++                for (k = 0; k < nseen && seen[k] != key; k++) {}
++                if (k == nseen && nseen < 256 && near <= 40) {
++                    static const char *reason[] = {"no target at that page", "not page-aligned", "target never drawn",
++                                                   "uploaded over since drawn", "target stale", "SAMPLES THE TARGET"};
++                    seen[nseen++] = key;
++                    fprintf(stderr, "[texsrc] tbp %04x (page %03x) psm %02x %ux%u: %s (nearest target %u pages away)\n", (unsigned)(t0 & 0x3FFF), page,
++                            tpsm, 1u << ((t0 >> 26) & 15), 1u << ((t0 >> 30) & 15), reason[why], near);
++                }
++                if (nseen == 1 && near <= 40) {
++                    fprintf(stderr, "[texsrc] targets:");
++                    for (k = 0; k < gsTargetCount; k++) { fprintf(stderr, " %03x%s", gsTargets[k].fbp, gsTargets[k].cleared ? "" : "(empty)"); }
++                    fprintf(stderr, "\n");
++                }
++            }
++        }
+         /* a frame buffer used as a texture: only if nothing was uploaded over it since it was drawn */
++        if (getenv("BT3_NO_TARGET_TEX") != NULL) { src = -1; } /* [ps2x] test: always GS memory */
++        { /* [ps2x] BT3_PAGE_TRACE: reads of pages 0x150..0x16F and draws into target 0x150 that frame */
++            int at;
++            static unsigned polled = ~0u;
++            if (gBt3PageTraceAt == -2) { gBt3PageTraceAt = getenv("BT3_PAGE_TRACE") != NULL ? atoi(getenv("BT3_PAGE_TRACE")) : -1; }
++            at = gBt3PageTraceAt;
++            if (at == -5 && polled != gGsFrame && gGsFrame % 15 == 0) { /* -5: the frame after pagetrace.go appears (cwd) */
++                FILE *go = fopen("pagetrace.go", "rb");
++                polled = gGsFrame;
++                if (go != NULL) { fclose(go); at = gBt3PageTraceAt = (int)gGsFrame + 1; }
++            }
++            {   /* [ps2x] BT3_150LOG=1: every draw into the work buffer 0x150, every frame (the ghost silhouettes) */
++                static int log150 = -1;
++                if (log150 < 0) { log150 = getenv("BT3_150LOG") != NULL; }
++                if (log150 && (uint32_t)(gGs.frame[ctx] & 0x1FF) == 0x150) {
++                    int ok = src >= 0 && (kept || ((t0 & 0x1F) == 0 && gsTargets[src].cleared && gsTargets[src].gen == gGsPageGen[gsTargets[src].fbp & 511]));
++                    fprintf(stderr, "[150] f %u vu %d spr %d tme %d tbp %04x psm %02x fbw %u fmsk %08x src %s%s scis %08llx\n", gGsFrame, vu, sprite, tme,
++                            (unsigned)(t0 & 0x3FFF), (unsigned)((t0 >> 20) & 0x3F), (unsigned)((gGs.frame[ctx] >> 16) & 0x3F),
++                            (unsigned)(gGs.frame[ctx] >> 32), !tme ? "-" : ok ? "target" : "memory", (src >= 0 && gsTargets[src].stale) ? " STALE" : "",
++                            (unsigned long long)gGs.scissor[ctx]);
++                }
++            }
++            if (at >= 0 && (int)gGsFrame == at) {
++                uint32_t page = (uint32_t)((t0 & 0x3FFF) / 32), fb = (uint32_t)(gGs.frame[ctx] & 0x1FF);
++                if ((page >= 0x150 && page < 0x170) || fb == 0x150) {
++                    int ok = src >= 0 && (kept || ((t0 & 0x1F) == 0 && gsTargets[src].cleared && gsTargets[src].gen == gGsPageGen[gsTargets[src].fbp & 511]));
++                    fprintf(stderr, "[pagetrace] DRAW into %03x vu %d sprite %d, texture tbp %04x psm %02x %ux%u -> %s (cleared %d gen %u pagegen %u)%c", fb, vu, sprite,
++                            (unsigned)(t0 & 0x3FFF), (unsigned)((t0 >> 20) & 0x3F), 1u << ((t0 >> 26) & 15), 1u << ((t0 >> 30) & 15),
++                            ok ? "target" : (page >= 0x150 && page < 0x170) ? "GS memory" : "-", src >= 0 ? gsTargets[src].cleared : -1,
++                            src >= 0 ? gsTargets[src].gen : 0, src >= 0 ? gGsPageGen[gsTargets[src].fbp & 511] : 0, 32);
++                    fprintf(stderr, "    prim %03x test %05x alpha %010llx tex0hi %08x fba %u frame %016llx zbuf %09llx tbw %u\n", (unsigned)(prim & 0x7FF), (unsigned)(test & 0x7FFFF),
++                            (unsigned long long)gGs.alpha[ctx], (unsigned)(t0 >> 32), (unsigned)(gGs.fba[ctx] & 1), (unsigned long long)gGs.frame[ctx], (unsigned long long)gGs.zbuf[ctx], (unsigned)((t0 >> 14) & 0x3F));
++                }
++            }
++        }
+         if (src >= 0 && (kept || ((t0 & 0x1F) == 0 && gsTargets[src].cleared && gsTargets[src].gen == gGsPageGen[gsTargets[src].fbp & 511]))) {
+             uint32_t tp = (uint32_t)((t0 >> 20) & 0x3F);
+             if (gsTargets[src].stale) {
+                 /* The buffer was meant to hold a copy or a step of an effect that was dropped; what it holds now
+                    is whatever was drawn there before (seen as blocks of noise over the picture). */
++                if (d->target != src && !screen_buffer((uint32_t)(gGs.frame[ctx] & 0x1FF))) {
++                    gsTargets[d->target].stale = 1; /* [ps2x] and the copy it should have made is missing too */
++                }
+                 gsSkipped++;
+                 return 0;
+             }
+@@ -580,7 +742,7 @@
+                 return 0;
+             }
+             if (src == d->target || tp > 1) {
+-                if (d->target != src && (uint32_t)(gGs.frame[ctx] & 0x1FF) != (uint32_t)gGsMainFbp) {
++                if (d->target != src && !screen_buffer((uint32_t)(gGs.frame[ctx] & 0x1FF))) {
+                     gsTargets[d->target].stale = 1; /* a work buffer missed a pass */
+                 }
+                 gsSkipped++;
+@@ -1302,6 +1464,10 @@
+ 
+     gsScale = getenv("BT3_SCALE") != NULL ? atoi(getenv("BT3_SCALE")) : Port_Setting("scale", 2);
+     gsScale = gsScale < 1 ? 1 : gsScale > 8 ? 8 : gsScale;
++    if (getenv("BT3_TARGET_W") != NULL) { gsTargetW = atoi(getenv("BT3_TARGET_W")); }   /* [ps2x] */
++    if (getenv("BT3_TARGET_H") != NULL) { gsTargetH = atoi(getenv("BT3_TARGET_H")); }
++    gsTargetW = gsTargetW < 64 ? 64 : gsTargetW > 1024 ? 1024 : gsTargetW;
++    gsTargetH = gsTargetH < 64 ? 64 : gsTargetH > 1024 ? 1024 : gsTargetH;
+     gsPendingScale = 0;
+     gsVerts = malloc(MAX_VERTS * sizeof(Vtx));
+     gsVuVerts = malloc(MAX_VU_VERTS * 48);
+@@ -1365,6 +1531,7 @@
+  * would jump far on screen (a camera cut, a teleport) is not blended, and when most are like that no in-between
+  * picture is shown at all. */
+ int gsInterp = -1;
++int gNativeGsInterpSkip; /* [ps2x] this tick shows only its real picture (the runtime's GPU is behind: no in-between ones) */
+ static uint32_t sInterpBlkView[MAX_VU_UNIFORMS], sInterpPrevBlkView[MAX_VU_UNIFORMS]; /* the view each block is drawn in (a number made of its draws' scissor rectangle) */
+ static float sInterpPrevRep[MAX_VU_UNIFORMS][3];
+ static uint8_t sInterpFollow[MAX_VU_UNIFORMS]; /* the block is scenery that goes with the camera (the far backdrop) */
+@@ -1419,6 +1586,37 @@
+                     }
+                 }
+             }
++            {   /* [ps2x] BT3_SIGDIFF=1: which of a vertex's 12 words change from one tick to the next for the block at the
++                   same place in the list, with the same count (what keeps a block from finding its partner) */
++                static int on = -1;
++                static uint32_t prevW[4096][48], prevCount[4096], hist[13], same, total, ticks, lastFrame;
++                if (on < 0) { on = getenv("BT3_SIGDIFF") != NULL; }
++                if (on && d->vu == 2 && d->uniform < 4096 && d->count >= 4) { /* (the scenery's program) */
++                    uint32_t cur[48] = {0}, u = (uint32_t)d->uniform, any = 0;
++                    for (k = 0; k < 4; k++) {
++                        uint32_t v = gsVuIdx[d->first + k];
++                        if (v < gsVuVertCount) { memcpy(&cur[k * 12], &gsVuVerts[v * 12], 48); }
++                    }
++                    if (prevCount[u] == d->count) {
++                        for (j = 0; j < 12; j++) {
++                            int ch = 0;
++                            for (k = 0; k < 4; k++) { ch |= cur[k * 12 + j] != prevW[u][k * 12 + j]; }
++                            if (ch) { hist[j]++; any = 1; }
++                        }
++                        same += !any;
++                        total++;
++                    }
++                    memcpy(prevW[u], cur, sizeof(cur));
++                    prevCount[u] = d->count;
++                    if (gGsFrame != lastFrame && ++ticks % 300 == 0) {
++                        fprintf(stderr, "sigdiff: %u blocks compared, %u identical; words changed:", total, same);
++                        for (j = 0; j < 12; j++) { fprintf(stderr, " %u", hist[j]); }
++                        fprintf(stderr, "\n");
++                        memset(hist, 0, sizeof(hist)); same = total = 0;
++                    }
++                    lastFrame = gGsFrame;
++                }
++            }
+             sig[d->uniform] = (sig[d->uniform] * 31u + h) | 1u;
+             sInterpKind[d->uniform] = (uint16_t)(d->vu * 64 + ((int)gsVuUni[d->uniform].misc[3] & 63));
+             sInterpBlkView[d->uniform] = INTERP_SCISSOR_ID(d);
+@@ -1820,12 +2018,25 @@
+             }
+         }
+     }
++    if (first && getenv("BT3_PAIRSTAT") != NULL) { /* [ps2x] per tick: blocks paired / not, by program kind */
++        static uint32_t pr[8], un[8], ticks;
++        uint32_t q;
++        for (q = 0; q < gsVuUniCount; q++) {
++            if (sInterpBlkView[q] != sInterpView || sInterpSig[q] == 0) { continue; }
++            if (sInterpPair[q] >= 0) { pr[(sInterpKind[q] >> 6) & 7]++; } else { un[(sInterpKind[q] >> 6) & 7]++; }
++        }
++        if (++ticks % 30 == 0) {
++            fprintf(stderr, "pairstat: frame %u paired/unpaired by program: 1 %u/%u  2 %u/%u  3 %u/%u  4 %u/%u\n", gGsFrame, pr[1], un[1], pr[2], un[2], pr[3], un[3], pr[4], un[4]);
++            memset(pr, 0, sizeof(pr)); memset(un, 0, sizeof(un));
++        }
++    }
+     /* 2. The camera's change. For an object standing still, screen matrix = camera * model, so (previous screen) =
+        D * (this screen) with one D for all of them: D = previous * inverse(this) of any still object (a pair whose
+        bones did not change). Taken from one such pair and accepted when another agrees; a few are tried. */
+     {
+-        int tries = 0;
++        int tries = 0, witnesses = 0;
+         uint32_t a, b;
++        float bestRatio = 1e30f; /* [ps2x] BT3_AGREE_LOG */
+ 
+         for (a = 0; a < gsVuUniCount && !agreed && tries < 8; a++) {
+         if (sInterpBlkView[a] != sInterpView) { continue; } /* (one view at a time) */
+@@ -1856,6 +2067,8 @@
+                     err += fabsf(chk[k] - q2->screen[k]);
+                     mag += fabsf(q2->screen[k]);
+                 }
++                witnesses++;
++                if (mag > 0.0f && err / mag < bestRatio) { bestRatio = err / mag; }
+                 if (err <= mag * 0.002f) {
+                     agreed = 1;
+                     {
+@@ -1892,6 +2105,16 @@
+                 break; /* (one witness per candidate) */
+             }
+         }
++        if (first && !agreed && getenv("BT3_AGREE_LOG") != NULL) {
++            uint32_t sc2 = 0, still = 0;
++            for (a = 0; a < gsVuUniCount; a++) {
++                if (sInterpBlkView[a] != sInterpView || (sInterpKind[a] >> 6) != 2) { continue; }
++                sc2++;
++                still += sInterpPair[a] >= 0 && memcmp(gsVuUni[a].boneA, sInterpPrev[sInterpPair[a]].boneA, 40 * sizeof(float)) == 0;
++            }
++            fprintf(stderr, "agree: frame %u view %u no camera: %u scenery blocks, %u paired and still, %d tried, %d witnesses, best error %.5f of size\n",
++                    gGsFrame, sInterpView, sc2, still, tries, witnesses, bestRatio);
++        }
+         sInterpHaveD = agreed && sInterpZMax > 0.0f;
+         sInterpRoots = 0;
+         if (agreed) {
+@@ -3290,7 +3513,7 @@
+             interp_signatures(sInterpSig);
+             sInterpPrimCount = interp_prims(sInterpPrims);
+         }
+-        if (gsInterp > 0 && sInterpSteps > 1 && interp_build(getenv("BT3_INTERP_T") != NULL ? (float)atof(getenv("BT3_INTERP_T")) : 1.0f / (float)sInterpSteps, 1)) {
++        if (gsInterp > 0 && sInterpSteps > 1 && !gNativeGsInterpSkip && interp_build(getenv("BT3_INTERP_T") != NULL ? (float)atof(getenv("BT3_INTERP_T")) : 1.0f / (float)sInterpSteps, 1)) {
+             uint64_t before;
+ 
+             sInterpSaved.verts = gsVertCount;

@@ -1,0 +1,320 @@
+--- /tmp/up_gs_gl.c	2026-10-16 15:19:11.131364900 -0700
++++ /tmp/our_gs_gl.c	2026-10-16 15:19:11.191263600 -0700
+@@ -83,6 +83,8 @@
+     X(glGenSamplers, void, (GLsizei, GLuint *), (GLsizei, GLuint *)) \
+     X(glBindSampler, void, (GLuint, GLuint), (GLuint, GLuint)) \
+     X(glSamplerParameteri, void, (GLuint, GLenum, GLint), (GLuint, GLenum, GLint)) \
++    X(glSamplerParameterf, void, (GLuint, GLenum, GLfloat), (GLuint, GLenum, GLfloat)) \
++    X(glGetFloatv, void, (GLenum, GLfloat *), (GLenum, GLfloat *)) \
+     X(glGenTextures, void, (GLsizei, GLuint *), (GLsizei, GLuint *)) \
+     X(glBindTexture, void, (GLenum, GLuint), (GLenum, GLuint)) \
+     X(glActiveTexture, void, (GLenum), (GLenum)) \
+@@ -214,7 +216,14 @@
+ #define PUSH(str) PUSHN((str), strlen(str))
+     const char *p = src;
+     while (*p) {
+-        if (!strncmp(p, "#version 450", 12)) { PUSH("#version 330 core"); p += 12; continue; }
++        if (!strncmp(p, "#version 450", 12)) {
++            char defs[96]; /* [ps2x] the target area (gs_draw.h) */
++            PUSH("#version 330 core");
++            snprintf(defs, sizeof(defs), "\n#define GS_HALF_W %d.0\n#define GS_HALF_H %d.0", GS_W / 2, GS_H / 2);
++            PUSH(defs);
++            p += 12;
++            continue;
++        }
+         if (!strncmp(p, "gl_VertexIndex", 14)) { PUSH("gl_VertexID"); p += 14; continue; }
+         if (!strncmp(p, "layout(set", 10)) {
+             const char *e = strchr(p, ')');
+@@ -603,6 +612,93 @@
+     }
+ }
+ 
++/* [ps2x] BT3_PROBE=1: on the BT3_PAGE_TRACE frame, a grid of points (every 32 GS pixels) of the shown buffer's
++   target; every draw that changes one is listed with what it is, and the frame is written to probe_frame.rgba
++   (GS_W x GS_H at 1x, top row first) -- finding the pass behind a wrong pixel */
++#define PROBE_GX 16
++#define PROBE_GY 14
++static void probe_dump(int t, const char *name) { /* a target at 1x, top row first */
++    uint32_t *pic = (uint32_t *)malloc((size_t)GS_W * SCALE * GS_H * SCALE * 4), *one = (uint32_t *)malloc((size_t)GS_W * GS_H * 4);
++    int x, y;
++    FILE *f;
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, sTgFbo[t]);
++    glReadBuffer(GL_COLOR_ATTACHMENT0);
++    glReadPixels(0, 0, GS_W * SCALE, GS_H * SCALE, GL_RGBA, GL_UNSIGNED_BYTE, pic);
++    for (y = 0; y < GS_H; y++) { for (x = 0; x < GS_W; x++) { one[y * GS_W + x] = pic[(size_t)(y * SCALE) * GS_W * SCALE + x * SCALE]; } }
++    f = fopen(name, "wb");
++    if (f != NULL) { fwrite(one, 4, (size_t)GS_W * GS_H, f); fclose(f); }
++    free(pic); free(one);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
++}
++
++static void probe_check(int n, int *cur) {
++    static int on = -1;
++    static uint32_t last[PROBE_GY][PROBE_GX];
++    extern int gBt3PageTraceAt;
++    int t, gx, gy;
++    if (on < 0) { on = getenv("BT3_PROBE") != NULL; }
++    if (!on || (int)gGsFrame != gBt3PageTraceAt || gGsMainFbp < 0) { return; }
++    t = GsDraw_TargetGet((uint32_t)gGsMainFbp, 0);
++    if (t < 0 || !gsTargets[t].cleared) { return; }
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, sTgFbo[t]);
++    glReadBuffer(GL_COLOR_ATTACHMENT0);
++    *cur = -1;
++    if (n >= -1 && n + 1 < (int)gsDrawCount) { /* the work buffer 0x150 just before the main picture first samples it */
++        static unsigned done = ~0u;
++        const GsDraw *nx = &gsDraws[n + 1];
++        if (done != gGsFrame && nx->tex_is_target && ((nx->t0 & 0x3FFF) / 32) == 0x150 && nx->target == t) {
++            int w = GsDraw_TargetGet(0x150, 0);
++            done = gGsFrame;
++            if (w >= 0) { probe_dump(w, "probe_150.rgba"); fprintf(stderr, "probe: 0x150 dumped before draw %d\n", n + 1); }
++            glBindFramebuffer(GL_READ_FRAMEBUFFER, sTgFbo[t]);
++            glReadBuffer(GL_COLOR_ATTACHMENT0);
++        }
++    }
++    if (n == -2) { /* the end of the frame: the whole picture */
++        uint32_t *pic = (uint32_t *)malloc((size_t)GS_W * SCALE * GS_H * SCALE * 4), *one = (uint32_t *)malloc((size_t)GS_W * GS_H * 4);
++        int x, y;
++        FILE *f;
++        glReadPixels(0, 0, GS_W * SCALE, GS_H * SCALE, GL_RGBA, GL_UNSIGNED_BYTE, pic);
++        for (y = 0; y < GS_H; y++) { for (x = 0; x < GS_W; x++) { one[y * GS_W + x] = pic[(size_t)(y * SCALE) * GS_W * SCALE + x * SCALE]; } }
++        f = fopen("probe_frame.rgba", "wb");
++        if (f != NULL) { fwrite(one, 4, (size_t)GS_W * GS_H, f); fclose(f); }
++        {   /* the work buffer at 0x150 too (its first 256 x 256) */
++            int w = GsDraw_TargetGet(0x150, 0);
++            if (w >= 0) {
++                glBindFramebuffer(GL_READ_FRAMEBUFFER, sTgFbo[w]);
++                glReadBuffer(GL_COLOR_ATTACHMENT0);
++                glReadPixels(0, 0, GS_W * SCALE, GS_H * SCALE, GL_RGBA, GL_UNSIGNED_BYTE, pic);
++                for (y = 0; y < GS_H; y++) { for (x = 0; x < GS_W; x++) { one[y * GS_W + x] = pic[(size_t)(y * SCALE) * GS_W * SCALE + x * SCALE]; } }
++                f = fopen("probe_150end.rgba", "wb");
++                if (f != NULL) { fwrite(one, 4, (size_t)GS_W * GS_H, f); fclose(f); }
++            }
++        }
++        fprintf(stderr, "probe: frame %u written (%dx%d)\n", gGsFrame, GS_W, GS_H);
++        remove("pagetrace.go");
++        gBt3PageTraceAt = -5; /* armed again: the next pagetrace.go */
++        free(pic); free(one);
++        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
++        return;
++    }
++    for (gy = 0; gy < PROBE_GY; gy++) {
++        for (gx = 0; gx < PROBE_GX; gx++) {
++            uint32_t c = 0;
++            glReadPixels(gx * 32 * SCALE + 16 * SCALE, gy * 32 * SCALE + 16 * SCALE, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &c);
++            if (n >= 0 && c != last[gy][gx]) {
++                const GsDraw *d = &gsDraws[n];
++                uint64_t q = d->t0;
++                fprintf(stderr, "probe: (%d,%d) draw %d native %d target %03x vu %d count %u pipe %08x tex %u%s tbp %04x tbw %u psm %02x %ux%u cbp %04x csa %u cld %u: %08x -> %08x\n",
++                        gx * 32 + 16, gy * 32 + 16, n, d->native, d->target >= 0 ? gsTargets[d->target].fbp : 0xFFF, d->vu, d->count,
++                        d->native ? 0 : sPipes[d->pipeline].key, (unsigned)d->tex, d->tex_is_target ? " (target)" : "", (unsigned)(q & 0x3FFF),
++                        (unsigned)((q >> 14) & 0x3F), (unsigned)((q >> 20) & 0x3F), 1u << ((q >> 26) & 15), 1u << ((q >> 30) & 15),
++                        (unsigned)((q >> 37) & 0x3FFF), (unsigned)((q >> 56) & 31), (unsigned)((q >> 61) & 7), last[gy][gx], c);
++            }
++            last[gy][gx] = c;
++        }
++    }
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
++}
++
+ static void bind_target(int i, int clear) {
+     GLenum bufs[2] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
+     glBindFramebuffer(GL_FRAMEBUFFER, sTgFbo[i]);
+@@ -752,7 +848,82 @@
+ }
+ 
+ /* ---- the frame ---------------------------------------------------------------------------------- */
++/* [ps2x] the PS2Recomp runtime presents the picture itself (native_gs_glue.cpp): which target was shown this frame,
++   and no present of our own into the (hidden) window */
++static int sShownBest = -1;
++int gNativeGsNoPresent;
++void (*gNativeGsOnShown)(void); /* called when a picture is finished: the real one or an in-between one */
++unsigned NativeGs_GlShown(int *w, int *h) {
++    if (sShownBest < 0 || sShownBest >= gsTargetCount || !gsTargets[sShownBest].cleared) {
++        return 0;
++    }
++    *w = 512 * SCALE;
++    *h = 448 * SCALE;
++    return sTgCol[sShownBest];
++}
++
++/* [ps2x] the picture being shown, at 512 x 448 (every SCALE-th pixel), to a .ppm (PS2X_NATIVE_GS_PICBURST) */
++void NativeGs_DumpShown(const char *name) {
++    /* (shrunk on the card first: reading the whole picture back at 6x took long enough to make the pacing drop the
++       in-between pictures, which is what was being looked at) */
++    static GLuint fbo, tex;
++    uint8_t *px, *row;
++    FILE *fp;
++    int y, x;
++    if (sShownBest < 0 || sShownBest >= gsTargetCount || !gsTargets[sShownBest].cleared) { return; }
++    if (fbo == 0) {
++        glGenTextures(1, &tex);
++        glBindTexture(GL_TEXTURE_2D, tex);
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 512, 448, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
++        glGenFramebuffers(1, &fbo);
++        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
++    }
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, sTgFbo[sShownBest]);
++    glReadBuffer(GL_COLOR_ATTACHMENT0);
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
++    glBlitFramebuffer(0, 0, 512 * SCALE, 448 * SCALE, 0, 0, 512, 448, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
++    px = malloc(512 * 448 * 4);
++    glPixelStorei(GL_PACK_ALIGNMENT, 1);
++    glReadPixels(0, 0, 512, 448, GL_RGBA, GL_UNSIGNED_BYTE, px);
++    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    fp = fopen(name, "wb");
++    if (fp != NULL) {
++        row = malloc(512 * 3);
++        fprintf(fp, "P6\n512 448\n255\n");
++        for (y = 0; y < 448; y++) {
++            for (x = 0; x < 512; x++) { memcpy(&row[x * 3], &px[(y * 512 + x) * 4], 3); }
++            fwrite(row, 1, 512 * 3, fp);
++        }
++        free(row);
++        fclose(fp);
++    }
++    free(px);
++}
++
++/* [ps2x] anisotropic filtering (Settings > Graphics): 1 = off, else 2..16 samples on the filtered samplers.
++   Applied here, on the renderer's own thread, when the setting changed. */
++volatile int gNativeGsAniso = 1;
++static void aniso_apply(void) {
++    static int s_cur = 1;
++    static float s_max = 0.0f;
++    int want = gNativeGsAniso, i;
++    if (want == s_cur) return;
++    s_cur = want;
++    if (s_max == 0.0f) {
++        glGetFloatv(0x84FF /* GL_MAX_TEXTURE_MAX_ANISOTROPY */, &s_max);
++        if (s_max < 1.0f) s_max = 1.0f;
++    }
++    for (i = 0; i < 16; i++)
++        if (i & (1 | 8))
++            glSamplerParameterf(sSamplers[i], 0x84FE /* GL_TEXTURE_MAX_ANISOTROPY */,
++                                want < 1 ? 1.0f : ((float)want > s_max ? s_max : (float)want));
++    fprintf(stderr, "bt3: gl: anisotropic filtering %dx (card max %.0fx)\n", want, s_max);
++}
++
+ static void frame_end(void) {
++    aniso_apply(); /* [ps2x] */
+     SDL_Event ev;
+     int cur = -1, best = -1, i;
+     uint32_t n;
+@@ -786,6 +957,38 @@
+         fprintf(stderr, "cut: frame %u has %u draws, keeping %u\n", gGsFrame, gsDrawCount, c < gsDrawCount ? c : gsDrawCount);
+         if (c < gsDrawCount) { gsDrawCount = c; }
+     }
++    if (getenv("BT3_GPU_SKIPFILE") != NULL) {
++        /* [ps2x] bisecting a picture: the file holds "a b"; draws a..b-1 (primitives) are not drawn. Listed once per
++           change of the range: what each skipped draw is. */
++        static int la = -1, lb = -1;
++        int a = -1, b = -1;
++        FILE *sf = fopen(getenv("BT3_GPU_SKIPFILE"), "rb");
++        if (sf != NULL) {
++            if (fscanf(sf, "%d %d", &a, &b) != 2) { a = b = -1; }
++            fclose(sf);
++        }
++        if (a != la || b != lb) {
++            uint32_t k;
++            fprintf(stderr, "skip: frame %u has %u draws, skipping %d..%d\n", gGsFrame, gsDrawCount, a, b - 1);
++            for (k = 0; a >= 0 && k < gsDrawCount && (int)k < b; k++) {
++                const GsDraw *d = &gsDraws[k];
++                uint64_t t = d->t0;
++                if ((int)k < a) { continue; }
++                fprintf(stderr, "skip:  %4u native %d target %03x vu %d count %5u tex %u%s tbp %04x tbw %u psm %02x %ux%u cbp %04x\n", k, d->native,
++                        d->target >= 0 ? gsTargets[d->target].fbp : 0xFFF, d->vu, d->count, (unsigned)d->tex, d->tex_is_target ? " (target)" : "",
++                        (unsigned)(t & 0x3FFF), (unsigned)((t >> 14) & 0x3F), (unsigned)((t >> 20) & 0x3F), 1u << ((t >> 26) & 15), 1u << ((t >> 30) & 15),
++                        (unsigned)((t >> 37) & 0x3FFF));
++            }
++            la = a;
++            lb = b;
++        }
++        if (a >= 0) {
++            uint32_t k;
++            for (k = (uint32_t)a; k < gsDrawCount && (int)k < b; k++) {
++                if (gsDraws[k].native == 0) { gsDraws[k].count = 0; }
++            }
++        }
++    }
+     if (getenv("BT3_GPU_TAIL") != NULL && (int)gGsFrame == atoi(getenv("BT3_GPU_TAIL"))) {
+         uint32_t k;
+         for (k = gsDrawCount > 14 ? gsDrawCount - 14 : 0; k < gsDrawCount; k++) {
+@@ -844,6 +1047,8 @@
+     glEnable(GL_SCISSOR_TEST);
+     for (n = 0; n < gsDrawCount; n++) {
+         const GsDraw *d = &gsDraws[n];
++        probe_check((int)n - 1, &cur); /* [ps2x] */
++        if (cur == -1) { haveFu = 0; sCurPipe = -1; haveScissor = 0; }
+         if (d->native >= 100) {
+             GLenum one[1] = {GL_COLOR_ATTACHMENT0};
+             if (sFbTex[d->native - 100] == 0) { continue; }
+@@ -944,12 +1149,18 @@
+         }
+     }
+ 
++    probe_check((int)gsDrawCount - 1, &cur); /* [ps2x] */
++    probe_check(-2, &cur);
+     /* the shown buffer: the one sceGsSwapDBuff set up for this frame, else the first target */
+     best = gGsMainFbp >= 0 ? GsDraw_TargetGet((uint32_t)gGsMainFbp, 0) : -1;
+     for (i = 0; best < 0 && i < gsTargetCount; i++) { best = i; }
++    sShownBest = best; /* [ps2x] */
++    if (gNativeGsOnShown != NULL) {
++        gNativeGsOnShown();
++    }
+     glBindVertexArray(0);
+     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+-    {
++    if (!gNativeGsNoPresent) { /* [ps2x] */
+         int sw, sh;
+         SDL_GetWindowSize(sWindow, &sw, &sh);
+         SDL_GetWindowSizeInPixels(sWindow, &sw, &sh); /* the drawable's real pixels (differs from the window on HiDPI / fullscreen) */
+@@ -1061,6 +1272,47 @@
+         }
+     }
+ 
++    /* [ps2x] BT3_SHOT_BURST=<n>: when shotburst.go appears in the working directory, the next n frames are written
++       to burst_NNN.ppm at 512 x 448 (every SCALE-th pixel), then the file is removed (finding flicker: what
++       changes from one frame to the next) */
++    {
++        static int burst = -1, left;
++        static unsigned polled = ~0u, k;
++        if (burst < 0) { burst = getenv("BT3_SHOT_BURST") != NULL ? atoi(getenv("BT3_SHOT_BURST")) : 0; }
++        if (burst > 0 && left == 0 && polled != gGsFrame && gGsFrame % 15 == 0) {
++            FILE *go = fopen("shotburst.go", "rb");
++            polled = gGsFrame;
++            if (go != NULL) { fclose(go); left = burst; k = 0; }
++        }
++        if (left > 0 && best >= 0 && gsTargets[best].cleared) {
++            GLsizei w = 512 * SCALE, h = 448 * SCALE;
++            uint8_t *px = malloc((size_t)w * h * 4);
++            char name[64];
++            FILE *fp;
++            glBindFramebuffer(GL_READ_FRAMEBUFFER, sTgFbo[best]);
++            glReadBuffer(GL_COLOR_ATTACHMENT0);
++            glPixelStorei(GL_PACK_ALIGNMENT, 1);
++            glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
++            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
++            snprintf(name, sizeof(name), "burst_%03u_%03x_%u.ppm", k++, gsTargets[best].fbp, gGsFrame);
++            fp = fopen(name, "wb");
++            if (fp != NULL) {
++                int y, x;
++                uint8_t *row = malloc(512 * 3);
++                fprintf(fp, "P6\n512 448\n255\n");
++                for (y = 0; y < 448; y++) {
++                    const uint8_t *s = &px[((size_t)(y * SCALE + SCALE / 2) * w) * 4];
++                    for (x = 0; x < 512; x++) { memcpy(&row[x * 3], &s[(x * SCALE + SCALE / 2) * 4], 3); }
++                    fwrite(row, 1, 512 * 3, fp);
++                }
++                free(row);
++                fclose(fp);
++            }
++            free(px);
++            if (--left == 0) { remove("shotburst.go"); }
++        }
++    }
++
+     for (i = 0; i < gsTargetCount; i++) { gsTargets[i].draws = 0; }
+     gsVertCount = 0;
+     gsVuVertCount = 0;

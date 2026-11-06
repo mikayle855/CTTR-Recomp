@@ -1,0 +1,25 @@
+--- /dev/fd/63	2026-10-10 22:29:39.000000000 -0700
++++ /dev/fd/62	2026-10-10 22:29:39.000000000 -0700
+@@ -13,8 +13,12 @@
+    their attachments with it. */
+ extern int gsScale;
+ #define SCALE gsScale
+-#define GS_W 1024
+-#define GS_H 1024
++/* [ps2x] the GS area a render target covers, in GS pixels: upstream 1024 x 1024; BT4 draws inside 640 x 512 (its frame
++   and smaller work buffers), so that is the default (BT3_TARGET_W / _H): 2.6 times less video memory per target,
++   which lets 6x fit a 4 GB card. Read once in GsGpu_Init; the shaders get it as GS_HALF_W / _H. */
++extern int gsTargetW, gsTargetH;
++#define GS_W gsTargetW
++#define GS_H gsTargetH
+ 
+ #define MAX_VERTS (1 << 20)
+ #define MAX_DRAWS (1 << 16)
+@@ -80,6 +84,7 @@
+     float orig[4];  /* a texture pack's replacement: xy = the original texture's size in texels, z = its largest alpha */
+     float blendc;
+     int scissor[4]; /* x, y, width, height, at SCALE */
++    uint64_t t0;    /* [ps2x] TEX0 of the draw (BT3_GPU_SKIPFILE listing) */
+ } GsDraw;
+ 
+ /* The formats a texture pack's replacement can be in (matches gs_texpack.h's TexPackImage.format). */

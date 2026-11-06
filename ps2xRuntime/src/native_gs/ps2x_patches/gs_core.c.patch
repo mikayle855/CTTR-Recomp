@@ -1,0 +1,99 @@
+--- /dev/fd/63	2026-10-10 22:29:38.000000000 -0700
++++ /dev/fd/62	2026-10-10 22:29:38.000000000 -0700
+@@ -690,6 +690,41 @@
+                 (unsigned)((gs.trxreg >> 32) & 0xFFF));
+     }
+     gs.transfer = (gs.trxdir & 3) == 0; /* only host -> GS */
++    { /* [ps2x] BT3_PAGE_TRACE=<frame>: uploads into pages 0x150..0x16F that frame */
++        extern int gBt3PageTraceAt; /* gs_draw.c (which also handles the pagetrace.go trigger) */
++        if (gBt3PageTraceAt >= 0 && (int)gGsFrame == gBt3PageTraceAt && (gs.trxdir & 3) == 0) {
++            uint32_t dbp = (gs.bitbltbuf >> 32) & 0x3FFF;
++            if (dbp / 32 >= 0x150 && dbp / 32 < 0x170) {
++                fprintf(stderr, "[pagetrace] UPLOAD dbp %04x dbw %u psm %02x %ux%u at %u,%u%c", (unsigned)dbp, (unsigned)((gs.bitbltbuf >> 48) & 0x3F),
++                        (unsigned)((gs.bitbltbuf >> 56) & 0x3F), (unsigned)(gs.trxreg & 0xFFF), (unsigned)((gs.trxreg >> 32) & 0xFFF),
++                        (unsigned)((gs.trxpos >> 32) & 0x7FF), (unsigned)((gs.trxpos >> 48) & 0x7FF), 10);
++            }
++        }
++    }
++    if ((gs.trxdir & 3) == 2) { /* [ps2x] GS -> GS (local copy), used by BT4: the rectangle, pixel by pixel */
++        uint32_t sbp = gs.bitbltbuf & 0x3FFF, sbw = (gs.bitbltbuf >> 16) & 0x3F, spsm = (gs.bitbltbuf >> 24) & 0x3F;
++        uint32_t dbp = (gs.bitbltbuf >> 32) & 0x3FFF, dbw = (gs.bitbltbuf >> 48) & 0x3F, dpsm = (gs.bitbltbuf >> 56) & 0x3F;
++        uint32_t sx = gs.trxpos & 0x7FF, sy = (gs.trxpos >> 16) & 0x7FF, dx = (gs.trxpos >> 32) & 0x7FF, dy = (gs.trxpos >> 48) & 0x7FF;
++        uint32_t w = gs.trxreg & 0xFFF, h = (gs.trxreg >> 32) & 0xFFF, x, y, bits = (uint32_t)Gs_PsmBits(dpsm);
++        static unsigned logged;
++        if (logged < 8) {
++            logged++;
++            fprintf(stderr, "[native_gs] GS->GS copy: sbp %04x sbw %u spsm %02x (%u,%u) -> dbp %04x dbw %u dpsm %02x (%u,%u) %ux%u\n",
++                    sbp, sbw, spsm, sx, sy, dbp, dbw, dpsm, dx, dy, w, h);
++        }
++        for (y = 0; y < h; y++) {
++            for (x = 0; x < w; x++) {
++                vram_rw(dbp, dbw, dpsm, dx + x, dy + y, 1, vram_rw(sbp, sbw, spsm, sx + x, sy + y, 0, 0));
++            }
++        }
++        {
++            uint32_t rowbytes = (dbw ? dbw : 1) * 64 * (bits ? bits : 32) / 8, first = dbp / 32 + (dy * rowbytes) / 8192;
++            uint32_t last = dbp / 32 + ((dy + h) * rowbytes + 8191) / 8192;
++            for (x = first; x <= last; x++) {
++                gGsPageGen[x & 511]++;
++            }
++        }
++    }
+     gs.tx = (gs.trxpos >> 32) & 0x7FF;
+     gs.ty = (gs.trxpos >> 48) & 0x7FF;
+     gs.tw = gs.trxreg & 0xFFF;
+@@ -921,6 +956,10 @@
+ /* One run of VIF data (32-bit words): GIF data (DIRECT) goes to the GS, everything else to VU1 (gs_vu1.c).
+    A command's data may continue in the next run (the command word often sits in the DMA tag, its data behind):
+    DIRECT data is passed on as it comes, the data of the other commands is collected first. */
++/* [ps2x] MSKPATH3: the runtime holds GIF-channel (path 3) uploads while the list masks path 3 and lets them through
++   at the point it unmasks it (BT4 streams stage textures that way, between the draws that use them). */
++void (*gNativeGsMskPath3)(int masked);
++
+ static void vif(const uint32_t *w, uint32_t count) {
+     static uint32_t direct;                    /* quadwords of GIF data still to come */
+     static uint32_t pend, need, have, buf[2048]; /* a command waiting for `need` words of data */
+@@ -989,6 +1028,7 @@
+         case 0x03: GsVu1_SetBase(imm); break;
+         case 0x04: GsVu1_SetItop(imm); break;
+         case 0x05: GsVu1_SetMode(imm); break;
++        case 0x06: if (gNativeGsMskPath3 != NULL) { gNativeGsMskPath3((int)((imm >> 15) & 1)); } break; /* [ps2x] MSKPATH3 */
+         case 0x14: case 0x15: GsVu1_Call((int)imm); break;
+         case 0x17: GsVu1_Call(-1); break;
+         case 0x20: need = 1; break;
+@@ -1444,6 +1484,35 @@
+     sMissingTex = 0;
+ }
+ 
++/* [ps2x] Entry points for the PS2Recomp runtime (native_gs_glue.cpp), which walks the DMA chains itself and hands
++   over the VIF1 stream it produced (DMA tags' upper words included when TTE is set) and the GIF channel's data. */
++void NativeGs_VifStream(const uint32_t *w, uint32_t count) {
++    if (gs_on()) {
++        vif(w, count);
++    }
++}
++
++void NativeGs_GifStream(const uint8_t *p, uint32_t qwc) {
++    if (gs_on()) {
++        Gs_Gif(p, qwc);
++    }
++}
++
++const uint32_t *NativeGs_Vram(void) { return sVram; } /* [ps2x] the GS memory, for comparisons */
++/* [ps2x] the texture registers (TEX0_1, TEX0_2, TEXA), for the texture-pack lookup */
++void NativeGs_TexRegs(uint64_t *tex0, uint64_t *texa) { tex0[0] = gGs.tex0[0]; tex0[1] = gGs.tex0[1]; *texa = gGs.texa; }
++
++void NativeGs_FrameEnd(void) {
++    if (!gs_on()) {
++        return;
++    }
++    GsVu1_FrameEnd();
++    if (sGpu) {
++        GsGpu_FrameEnd();
++    }
++    screenshot(); /* also counts the frame */
++}
++
+ /* The game reads a piece of a frame buffer back (sceGsExecStoreImage; the cross-fade of the fight's scenes takes the
+    frame being shown, 512 x 224 at a time). `bp` in units of 64 pixels: 0xE00 a frame buffer (32 a page), 8 a row of
+    512. Delivered as 3 bytes a pixel, top row first.

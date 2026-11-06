@@ -56,7 +56,7 @@ toolchain: Visual Studio Build Tools with clang-cl, CMake, Ninja, Python. SDL2, 
 CMake at configure time. The ISO is extracted with Windows' own `tar.exe` (or 7-Zip).
 
 ```
-git clone --recursive https://github.com/<owner>/CTTR-Recomp C:\CTTR-Recomp
+git clone --recursive https://github.com/mikayle855/CTTR-Recomp C:\CTTR-Recomp
 cd C:\CTTR-Recomp
 powershell -ExecutionPolicy Bypass -File games\cttr\build.ps1 "<path to your CTTR PAL .iso>"
 ```

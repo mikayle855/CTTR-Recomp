@@ -33,7 +33,7 @@ the C++ Clang tools (clang-cl), CMake 3.27+, Ninja, Python 3.10+, Git, a Vulkan-
 `install-deps-windows.ps1 -Install` sets up the toolchain.
 
 ```
-git clone --recursive https://github.com/<owner>/CTTR-Recomp C:\CTTR-Recomp
+git clone --recursive https://github.com/mikayle855/CTTR-Recomp C:\CTTR-Recomp
 cd C:\CTTR-Recomp
 powershell -ExecutionPolicy Bypass -File games\cttr\build.ps1 "<path to your CTTR PAL .iso>"
 games\cttr\launcher\build_launcher.bat

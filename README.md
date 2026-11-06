@@ -1,5 +1,13 @@
 # CTTR-Recomp — Crash Tag Team Racing, natively on PC
 
+> ## ⚠️ This project is no longer maintained — please take it over
+>
+> The original author has finished working on this port and **will not continue it**: issues and pull requests here
+> will not be answered. **You are welcome to fork it and carry it on** — fix bugs, add features or mods, port it to
+> other platforms, or make your fork the new home of the project (the GPL-3.0 licence allows all of this; just keep
+> it GPL and keep the credits). Everything needed to get started is in
+> [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md). If an active fork appears, it is the place to go.
+
 A statically recompiled, native Windows port of *Crash Tag Team Racing* (PS2, Europe/Australia, **SLES-53439**),
 built on [PS2Recomp](https://github.com/ran-j/PS2Recomp). The game's MIPS code is translated to C++ **at build time,
 from your own disc image**: this repository contains no game code, assets or media.

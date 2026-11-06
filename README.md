@@ -7,6 +7,9 @@
 > other platforms, or make your fork the new home of the project (the GPL-3.0 licence allows all of this; just keep
 > it GPL and keep the credits). Everything needed to get started is in
 > [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md). If an active fork appears, it is the place to go.
+>
+> This repository is **archived** (read-only): nothing more will change here. Use the **Fork** button to start your
+> own copy and continue from there.
 
 A statically recompiled, native Windows port of *Crash Tag Team Racing* (PS2, Europe/Australia, **SLES-53439**),
 built on [PS2Recomp](https://github.com/ran-j/PS2Recomp). The game's MIPS code is translated to C++ **at build time,
